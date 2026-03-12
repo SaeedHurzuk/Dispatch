@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.1] — 2026-03-12
+
+### Fixed
+- **ASCII art missing top border on startup** — the `╔═══╗` top line was absent from
+  both the startup banner and `--version` output. The heredoc block was being injected
+  without the top border line, leaving the box visually open at the top. Fixed by
+  ensuring the full box including `╔═══╗` is always included in the heredoc content
+- **Stray `════` separator above ASCII art** — `banner()` was being called immediately
+  before the startup heredoc, printing a `════` line directly above the `╔═══╗` border.
+  Removed the redundant `banner()` call so the box renders cleanly on its own
+
+---
+
 ## [1.0.0] — 2025-03-11
 
 ### Initial release
