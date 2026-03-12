@@ -1,0 +1,1065 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Dispatch — Production-grade transparent rsync wrapper
+# Version: 1.0.0
+#
+# Features:
+#   - Transparent drop-in replacement for rsync (all args pass through)
+#   - SMTP email notifications via curl (HTML + plain text)
+#   - Notify on: always | failure | success | warnings
+#   - Optional start notification email
+#   - Webhook support (Slack, Discord, ntfy.sh, generic HTTP POST)
+#   - Dead man's switch / heartbeat ping (Healthchecks.io, Uptime Kuma)
+#   - SMTP connection test without running a sync (--smtp-test)
+#   - Retry logic with configurable attempts and backoff delay
+#   - Lock file to prevent concurrent runs on the same destination
+#   - Config file support (/etc/dispatch.conf + ~/.dispatch.conf)
+#   - Dry-run detection (clearly flagged in email)
+#   - Signal trapping (SIGINT/SIGTERM — sends failure email on kill)
+#   - Stats parsing (files transferred, size, speed, pulled into email header)
+#   - Stats captured in-memory — available with or without --logfile
+#   - Log file support with automatic rotation (keep N recent logs)
+#   - Multiple SMTP recipients (comma-separated)
+#   - Pre/post hook scripts
+#   - Quiet mode (suppress wrapper output, rsync output still shown)
+#   - Runtime env var overrides for all SMTP settings
+#   - Anti-recursion: auto-locates real rsync binary, never calls itself
+#
+# Install:
+#   sudo cp rsync /usr/local/bin/rsync
+#   sudo chmod +x /usr/local/bin/rsync
+#
+# Wrapper flags (all stripped before reaching real rsync):
+#   --smtp-enable          Enable SMTP for this run
+#   --smtp-disable         Disable SMTP for this run (default)
+#   --smtp-test            Test SMTP connection and exit (no sync runs)
+#   --logfile              Enable log file for this run
+#   --notify=always        Email on success and failure (default when SMTP on)
+#   --notify=failure       Email only on failure
+#   --notify=success       Email only on success
+#   --notify=warnings      Email only on exit-code-24 (partial transfer)
+#   --notify-start         Also send an email when the sync begins
+#   --html-email           Send styled HTML email (default: on)
+#   --no-html-email        Force plain text email
+#   --retry=N              Retry up to N times on failure (default: 0)
+#   --retry-delay=N        Seconds to wait between retries (default: 30)
+#   --pre-hook=/path       Script to run before rsync
+#   --post-hook=/path      Script to run after rsync
+#   --no-lock              Disable lock file, allow concurrent runs
+#   --webhook=URL          POST notification to URL on completion
+#   --webhook-on=EVENT     When to fire webhook: always|failure|success (default: always)
+#   --ping-url=URL         GET this URL on success — dead man's switch / heartbeat
+#   --quiet                Suppress wrapper header/footer output
+#   --upgrade              Self-update Dispatch to the latest version
+#   --version              Print version and exit
+#   --help, -h             Show Dispatch wrapper help
+#   --rsync-help           Show the real rsync binary's own --help output
+#
+# Config file (optional, sourced in order — later overrides earlier):
+#   /etc/dispatch.conf
+#   ~/.dispatch.conf
+#
+# Environment variable overrides:
+#   DISPATCH_HOST, DISPATCH_PORT, DISPATCH_USER, DISPATCH_PASS
+#   DISPATCH_FROM, DISPATCH_TO, DISPATCH_TLS
+# =============================================================================
+
+set -euo pipefail
+
+# ── Version ───────────────────────────────────────────────────────────────────
+readonly VERSION="1.0.0"
+readonly SCRIPT_NAME="dispatch"
+
+# =============================================================================
+# DEFAULT CONFIGURATION — overridden by config file, env vars, or CLI flags
+# =============================================================================
+
+# ── SMTP ──────────────────────────────────────────────────────────────────────
+SMTP_HOST="smtp.example.com"
+SMTP_PORT="587"
+SMTP_USER="you@example.com"
+SMTP_PASS="your-smtp-password"
+SMTP_FROM="rsync@example.com"
+SMTP_TO="recipient@example.com"   # Comma-separate for multiple: "a@x.com,b@x.com"
+SMTP_TLS="starttls"               # starttls | ssl | none
+
+SMTP_ENABLED=false                # Default off — use --smtp-enable per run
+HTML_EMAIL=true                   # Default on — use --no-html-email to force plain text
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+NOTIFY_ON="always"                # always | failure | success | warnings
+NOTIFY_START=false                # Send email when sync starts
+
+# ── Webhooks ──────────────────────────────────────────────────────────────────
+WEBHOOK_URL=""                    # POST to this URL on completion (Slack, Discord, ntfy.sh...)
+WEBHOOK_ON="always"               # always | failure | success
+
+# ── Dead man's switch ─────────────────────────────────────────────────────────
+PING_URL=""                       # GET this URL on success only (Healthchecks.io, Uptime Kuma...)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_ENABLED=false                 # Default off — use --logfile per run
+LOG_DIR="/var/log/dispatch"
+LOG_ROTATE_KEEP=30                # Number of log files to keep
+
+# ── Lock ──────────────────────────────────────────────────────────────────────
+LOCK_DIR="/tmp/dispatch-locks"  # Lock files live here
+NO_LOCK=false                     # Set true with --no-lock to skip locking
+
+# ── Retry ─────────────────────────────────────────────────────────────────────
+RETRY_COUNT=0                     # Retry attempts on failure (0 = no retry)
+RETRY_DELAY=30                    # Seconds between retries
+
+# ── Hooks ─────────────────────────────────────────────────────────────────────
+PRE_HOOK=""                       # Path to script to run before rsync
+POST_HOOK=""                      # Path to script to run after rsync
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+QUIET=false                       # Suppress wrapper header/footer
+
+# =============================================================================
+
+# ── Source config files if present ───────────────────────────────────────────
+[[ -f /etc/dispatch.conf     ]] && source /etc/dispatch.conf
+[[ -f "$HOME/.dispatch.conf" ]] && source "$HOME/.dispatch.conf"
+
+# ── Environment variable overrides ───────────────────────────────────────────
+SMTP_HOST="${DISPATCH_HOST:-$SMTP_HOST}"
+SMTP_PORT="${DISPATCH_PORT:-$SMTP_PORT}"
+SMTP_USER="${DISPATCH_USER:-$SMTP_USER}"
+SMTP_PASS="${DISPATCH_PASS:-$SMTP_PASS}"
+SMTP_FROM="${DISPATCH_FROM:-$SMTP_FROM}"
+SMTP_TO="${DISPATCH_TO:-$SMTP_TO}"
+SMTP_TLS="${DISPATCH_TLS:-$SMTP_TLS}"
+
+# ── Locate the real rsync binary (anti-recursion) ────────────────────────────
+RSYNC_BIN=""
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+while IFS= read -r -d ':' dir; do
+  dir="${dir%/}"
+  [[ -z "$dir" ]] && continue
+  [[ "$dir" == "$SELF_DIR" ]] && continue
+  if [[ -x "$dir/rsync" ]]; then
+    RSYNC_BIN="$dir/rsync"
+    break
+  fi
+done <<< "${PATH}:"
+
+if [[ -z "$RSYNC_BIN" ]]; then
+  echo -e "\033[1;33m[⚠] rsync binary not found in PATH — attempting to install...\033[0m" >&2
+
+  _installed=false
+  if   command -v apt-get &>/dev/null; then apt-get update -qq && apt-get install -y -qq rsync && _installed=true
+  elif command -v dnf     &>/dev/null; then dnf install -y -q rsync                           && _installed=true
+  elif command -v yum     &>/dev/null; then yum install -y -q rsync                           && _installed=true
+  elif command -v pacman  &>/dev/null; then pacman -Sy --noconfirm rsync                      && _installed=true
+  elif command -v zypper  &>/dev/null; then zypper install -y rsync                           && _installed=true
+  elif command -v brew    &>/dev/null; then brew install rsync                                && _installed=true
+  fi
+
+  if ! $_installed; then
+    echo -e "\033[0;31m[✘] FATAL: Could not locate or install rsync. Please install it manually:\033[0m" >&2
+    echo "      apt install rsync  /  dnf install rsync  /  brew install rsync" >&2
+    exit 1
+  fi
+
+  while IFS= read -r -d ':' dir; do
+    dir="${dir%/}"
+    [[ -z "$dir" ]] && continue
+    [[ "$dir" == "$SELF_DIR" ]] && continue
+    if [[ -x "$dir/rsync" ]]; then
+      RSYNC_BIN="$dir/rsync"
+      break
+    fi
+  done <<< "${PATH}:"
+
+  if [[ -z "$RSYNC_BIN" ]]; then
+    echo -e "\033[0;31m[✘] FATAL: rsync was installed but still cannot be found in PATH.\033[0m" >&2
+    exit 1
+  fi
+
+  echo -e "\033[0;32m[✔] rsync installed and located at: ${RSYNC_BIN}\033[0m" >&2
+fi
+
+# ── Colour codes ──────────────────────────────────────────────────────────────
+if [ -t 1 ] || [ -t 2 ] || { [ -e /dev/tty ] && tty -s 2>/dev/null; }; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+  CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+ts()      { date '+%Y-%m-%d %H:%M:%S'; }
+log()     { $QUIET || echo -e "${CYAN}[$(ts)]${RESET} $*"; }
+success() { $QUIET || echo -e "${GREEN}[✔] $*${RESET}"; }
+warn()    { echo -e "${YELLOW}[⚠] $*${RESET}"; }
+error()   { echo -e "${RED}[✘] $*${RESET}" >&2; }
+die()     { error "$*"; exit 1; }
+banner()  { $QUIET || echo -e "${BOLD}════════════════════════════════════════════════════${RESET}"; }
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+
+${BOLD}${SCRIPT_NAME} v${VERSION}${RESET} -- Transparent rsync wrapper with SMTP notifications
+
+${BOLD}Usage:${RESET}
+  rsync [WRAPPER OPTIONS] [RSYNC OPTIONS] <source> <destination>
+
+${BOLD}Wrapper Options:${RESET}
+  --smtp-enable            Enable SMTP email notification for this run
+  --smtp-disable           Disable SMTP (default)
+  --smtp-test              Test SMTP connection and exit — no sync runs
+  --logfile                Save output to timestamped log file
+  --notify=always          Email on success and failure (default)
+  --notify=failure         Email only on failure
+  --notify=success         Email only on success
+  --notify=warnings        Email only on exit-code-24 (partial transfer)
+  --notify-start           Send an email when the sync starts
+  --html-email             Send styled HTML email (default: plain text)
+  --no-html-email          Force plain text even if HTML_EMAIL=true in config
+  --retry=N                Retry N times on failure before giving up
+  --retry-delay=N          Seconds to wait between retries (default: 30)
+  --pre-hook=/path         Run this script before rsync executes
+  --post-hook=/path        Run this script after rsync completes
+  --no-lock                Disable lock file, allow concurrent runs
+  --webhook=URL            POST notification to URL on completion
+  --webhook-on=EVENT       When to fire webhook: always|failure|success (default: always)
+  --ping-url=URL           GET this URL on success — dead man's switch / heartbeat
+  --quiet                  Suppress wrapper header/footer (rsync output unaffected)
+  --rsync-help             Show the real rsync binary's own --help output
+  --upgrade                Self-update Dispatch to the latest version
+  --version                Print version and exit
+  --help, -h               Show this help
+
+${BOLD}Examples:${RESET}
+  rsync -avhr --progress /src/ /dst/
+  rsync --smtp-enable -avhr /src/ /dst/
+  rsync --smtp-enable --notify=failure --retry=3 -avhr /src/ /dst/
+  rsync --smtp-enable --html-email --logfile --notify-start -avhr /src/ /dst/
+  rsync --webhook=https://hooks.slack.com/services/xxx -avhr /src/ /dst/
+  rsync --ping-url=https://hc-ping.com/your-uuid --smtp-enable -avhr /src/ /dst/
+  rsync --smtp-test
+
+${BOLD}Config files (sourced in order):${RESET}
+  /etc/dispatch.conf
+  ~/.dispatch.conf
+
+${BOLD}Environment overrides:${RESET}
+  DISPATCH_HOST, DISPATCH_PORT, DISPATCH_USER
+  DISPATCH_PASS, DISPATCH_FROM, DISPATCH_TO, DISPATCH_TLS
+
+${BOLD}Provider quick reference:${RESET}
+  Gmail:       smtp.gmail.com        port 587  starttls  (requires App Password)
+  Office 365:  smtp.office365.com    port 587  starttls
+  Outlook.com: smtp-mail.outlook.com port 587  starttls
+  SendGrid:    smtp.sendgrid.net     port 587  starttls
+
+EOF
+  exit 0
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+RSYNC_ARGS=()
+IS_DRY_RUN=false
+_SMTP_TEST=false
+_DO_UPGRADE=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --smtp-enable)      SMTP_ENABLED=true ;;
+    --smtp-disable)     SMTP_ENABLED=false ;;
+    --smtp-test)        _SMTP_TEST=true ;;
+    --logfile)          LOG_ENABLED=true ;;
+    --notify=always)    NOTIFY_ON="always" ;;
+    --notify=failure)   NOTIFY_ON="failure" ;;
+    --notify=success)   NOTIFY_ON="success" ;;
+    --notify=warnings)  NOTIFY_ON="warnings" ;;
+    --notify-start)     NOTIFY_START=true ;;
+    --html-email)       HTML_EMAIL=true ;;
+    --no-html-email)    HTML_EMAIL=false ;;
+    --retry=*)          RETRY_COUNT="${arg#--retry=}" ;;
+    --retry-delay=*)    RETRY_DELAY="${arg#--retry-delay=}" ;;
+    --pre-hook=*)       PRE_HOOK="${arg#--pre-hook=}" ;;
+    --post-hook=*)      POST_HOOK="${arg#--post-hook=}" ;;
+    --no-lock)          NO_LOCK=true ;;
+    --webhook=*)        WEBHOOK_URL="${arg#--webhook=}" ;;
+    --webhook-on=*)     WEBHOOK_ON="${arg#--webhook-on=}" ;;
+    --ping-url=*)       PING_URL="${arg#--ping-url=}" ;;
+    --quiet)            QUIET=true ;;
+    --rsync-help)       exec "$RSYNC_BIN" --help ;;
+    --upgrade)          _DO_UPGRADE=true ;;
+    --version)
+      echo -e "${CYAN}"
+      cat << 'ASCIIART'
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                                                                           ║
+║   ██████╗  ██╗ ███████╗ ██████╗   █████╗  ████████╗  ██████╗ ██╗  ██╗     ║
+║   ██╔══██╗ ██║ ██╔════╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝ ██╔════╝ ██║  ██║     ║
+║   ██║  ██║ ██║ ███████╗ ██████╔╝ ███████║    ██║    ██║      ███████║     ║
+║   ██║  ██║ ██║ ╚════██║ ██╔═══╝  ██╔══██║    ██║    ██║      ██╔══██║     ║
+║   ██████╔╝ ██║ ███████║ ██║      ██║  ██║    ██║    ╚██████╗ ██║  ██║     ║
+║   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝      ╚═╝  ╚═╝    ╚═╝     ╚═════╝ ╚═╝  ╚═╝     ║
+║                                                                           ║
+║                   ◄──── notify · rsync · deliver ────►                    ║
+║                                                                           ║
+ASCIIART
+      printf "║%s Dispatch · Smart rsync notifications · v%-6s %s          ║\n" "         " "${VERSION}" "        "
+      echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+      echo -e "${RESET}"
+      echo "  Wrapper : v${VERSION}"
+      echo "  rsync   : $("$RSYNC_BIN" --version 2>&1 | head -1)"
+      echo ""
+      exit 0
+      ;;
+    --help|-h)      usage ;;
+    --dry-run|-n)   IS_DRY_RUN=true; RSYNC_ARGS+=("$arg") ;;
+    *)              RSYNC_ARGS+=("$arg") ;;
+  esac
+done
+
+# ── SMTP test ─────────────────────────────────────────────────────────────────
+smtp_test() {
+  echo ""
+  log "Testing SMTP connection to ${SMTP_HOST}:${SMTP_PORT}..."
+  log "From : ${SMTP_FROM}"
+  log "To   : ${SMTP_TO%%,*}"
+  echo ""
+
+  local tls_flag=""
+  case "$SMTP_TLS" in
+    starttls) tls_flag="--ssl-reqd" ;;
+    ssl)      tls_flag="--ssl"      ;;
+    none)     tls_flag=""           ;;
+  esac
+
+  local exit_code=0
+  curl --silent --show-error --connect-timeout 10 \
+    --url "smtp://${SMTP_HOST}:${SMTP_PORT}" \
+    ${tls_flag} \
+    --user "${SMTP_USER}:${SMTP_PASS}" \
+    --mail-from "${SMTP_FROM}" \
+    --mail-rcpt "${SMTP_TO%%,*}" \
+    --upload-file - <<< $'Subject: Dispatch connection test\r\n\r\nSMTP connection test from Dispatch wrapper.' \
+    && exit_code=0 || exit_code=$?
+
+  echo ""
+  if [[ "$exit_code" -eq 0 ]]; then
+    echo -e "${GREEN}[✔] SMTP test passed -- check ${SMTP_TO%%,*} for the test email.${RESET}"
+  else
+    echo -e "${RED}[✘] SMTP test failed (curl exit: ${exit_code})${RESET}" >&2
+    echo -e "${YELLOW}[⚠] Debug: curl -v --url smtp://${SMTP_HOST}:${SMTP_PORT} ${tls_flag} --user '${SMTP_USER}:<pass>' --mail-from '${SMTP_FROM}' --mail-rcpt '${SMTP_TO%%,*}'${RESET}"
+  fi
+  echo ""
+  return "$exit_code"
+}
+
+if $_SMTP_TEST; then
+  smtp_test
+  exit $?
+fi
+
+# ── Self-upgrade ──────────────────────────────────────────────────────────────
+do_upgrade() {
+  local installer_url="https://raw.githubusercontent.com/SaeedHurzuk/Dispatch/refs/heads/main/install.sh"
+
+  # Upgrading writes to /usr/local/bin — must be root
+  if [[ "$EUID" -ne 0 ]]; then
+    echo ""
+    error "rsync --upgrade must be run as root (it writes to /usr/local/bin)."
+    echo -e "  Run: ${BOLD}sudo rsync --upgrade${RESET}" >&2
+    echo ""
+    exit 1
+  fi
+
+  echo ""
+  log "Dispatch self-upgrade"
+  log "Current version : v${VERSION}"
+  log "Fetching latest installer from GitHub..."
+
+  if ! command -v curl &>/dev/null; then
+    die "curl is required for --upgrade. Install it first: apt install curl"
+  fi
+
+  local tmp_installer
+  tmp_installer=$(mktemp /tmp/dispatch-installer.XXXXXX)
+
+  local fetch_exit=0
+  curl -fsSL "$installer_url" -o "$tmp_installer" || fetch_exit=$?
+
+  if [[ "$fetch_exit" -ne 0 ]]; then
+    rm -f "$tmp_installer"
+    die "Failed to fetch installer (curl exit: ${fetch_exit}). Check your internet connection."
+  fi
+
+  bash -n "$tmp_installer" || { rm -f "$tmp_installer"; die "Downloaded installer failed syntax check — aborting."; }
+
+  log "Running installer --update..."
+  echo ""
+  bash "$tmp_installer" --update
+  local upgrade_exit=$?
+  rm -f "$tmp_installer"
+  exit "$upgrade_exit"
+}
+
+if $_DO_UPGRADE; then
+  do_upgrade
+fi
+
+
+
+# ── Proxy bare call to real rsync ─────────────────────────────────────────────
+if [[ ${#RSYNC_ARGS[@]} -eq 0 ]]; then
+  exec "$RSYNC_BIN"
+fi
+
+# ── Input validation ──────────────────────────────────────────────────────────
+[[ "$RETRY_COUNT"  =~ ^[0-9]+$ ]] || die "--retry value must be a non-negative integer"
+[[ "$RETRY_DELAY"  =~ ^[0-9]+$ ]] || die "--retry-delay value must be a non-negative integer"
+
+if [[ -n "$PRE_HOOK" ]]; then
+  [[ -f "$PRE_HOOK" && -x "$PRE_HOOK" ]] || die "Pre-hook not found or not executable: '$PRE_HOOK'"
+fi
+if [[ -n "$POST_HOOK" ]]; then
+  [[ -f "$POST_HOOK" && -x "$POST_HOOK" ]] || die "Post-hook not found or not executable: '$POST_HOOK'"
+fi
+
+case "$NOTIFY_ON" in
+  always|failure|success|warnings) ;;
+  *) die "Invalid --notify value: '$NOTIFY_ON'. Use: always | failure | success | warnings" ;;
+esac
+
+case "$WEBHOOK_ON" in
+  always|failure|success) ;;
+  *) die "Invalid --webhook-on value: '$WEBHOOK_ON'. Use: always | failure | success" ;;
+esac
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+command -v curl &>/dev/null || die "'curl' is not installed. Run: apt install curl"
+
+# ── Extract source and destination for email subject ─────────────────────────
+_positional=()
+for _a in "${RSYNC_ARGS[@]}"; do
+  [[ "$_a" != -* ]] && _positional+=("$_a")
+done
+SRC_ARG=""
+DEST_ARG=""
+if [[ ${#_positional[@]} -ge 2 ]]; then
+  SRC_ARG="${_positional[-2]}"
+  DEST_ARG="${_positional[-1]}"
+elif [[ ${#_positional[@]} -eq 1 ]]; then
+  DEST_ARG="${_positional[0]}"
+fi
+unset _positional _a
+
+# ── Log file setup ────────────────────────────────────────────────────────────
+LOG_FILE=""
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+
+if $LOG_ENABLED; then
+  mkdir -p "$LOG_DIR" || die "Cannot create log directory: '$LOG_DIR'"
+  LOG_FILE="${LOG_DIR}/rsync_${TIMESTAMP}.log"
+fi
+
+# ── Stats capture temp file ───────────────────────────────────────────────────
+STATS_TMP=$(mktemp /tmp/dispatch-stats.XXXXXX)
+trap 'rm -f "$STATS_TMP"' EXIT
+
+# ── Lock file ─────────────────────────────────────────────────────────────────
+DEST_ARG_LOCK="${RSYNC_ARGS[-1]}"
+LOCK_KEY=$(echo "$DEST_ARG_LOCK" | tr '/' '_' | tr -cd '[:alnum:]_-')
+LOCK_FILE="${LOCK_DIR}/Dispatch_${LOCK_KEY}.lock"
+
+acquire_lock() {
+  $NO_LOCK && return 0
+  mkdir -p "$LOCK_DIR"
+  if [[ -f "$LOCK_FILE" ]]; then
+    local existing_pid
+    existing_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+      die "Another rsync to the same destination is already running (PID: $existing_pid). Lock: $LOCK_FILE"
+    else
+      warn "Stale lock file found (PID $existing_pid no longer running). Removing."
+      rm -f "$LOCK_FILE"
+    fi
+  fi
+  echo $$ > "$LOCK_FILE"
+}
+
+release_lock() {
+  $NO_LOCK && return 0
+  rm -f "$LOCK_FILE"
+}
+
+# ── Output helpers (stdout + optional log file) ───────────────────────────────
+tee_output() {
+  if $LOG_ENABLED && [[ -n "$LOG_FILE" ]]; then
+    tee -a "$STATS_TMP" | tee -a "$LOG_FILE"
+  else
+    tee -a "$STATS_TMP"
+  fi
+}
+
+write_output() {
+  if $LOG_ENABLED && [[ -n "$LOG_FILE" ]]; then
+    echo "$*" | tee -a "$STATS_TMP" | tee -a "$LOG_FILE"
+  else
+    echo "$*" | tee -a "$STATS_TMP"
+  fi
+}
+
+# ── Log rotation ──────────────────────────────────────────────────────────────
+rotate_logs() {
+  if $LOG_ENABLED && [[ -d "$LOG_DIR" ]]; then
+    local count
+    count=$(ls -1 "${LOG_DIR}"/rsync_*.log 2>/dev/null | wc -l)
+    if [[ "$count" -gt "$LOG_ROTATE_KEEP" ]]; then
+      ls -1t "${LOG_DIR}"/rsync_*.log | tail -n +"$((LOG_ROTATE_KEEP + 1))" | xargs rm -f
+      log "Log rotation: kept ${LOG_ROTATE_KEEP} most recent, removed $((count - LOG_ROTATE_KEEP)) old files."
+    fi
+  fi
+}
+
+# ── Parse stats from captured output ─────────────────────────────────────────
+parse_rsync_stats() {
+  if [[ ! -s "$STATS_TMP" ]]; then
+    PARSED_STATS=""
+    return
+  fi
+  local files speed sent
+  files=$(grep -oE 'Number of regular files transferred: [0-9,]+' "$STATS_TMP" 2>/dev/null | sed 's/Number of regular files transferred: //' || true)
+  speed=$(grep -oE 'Transfer rate: [^
+]+' "$STATS_TMP" 2>/dev/null | sed 's/Transfer rate: //' | head -1 || true)
+  sent=$(grep -oE 'Total transferred file size: [^
+]+' "$STATS_TMP" 2>/dev/null | sed 's/Total transferred file size: //' || true)
+
+  if [[ -n "$files" || -n "$sent" || -n "$speed" ]]; then
+    PARSED_STATS=""
+    [[ -n "$files" ]] && PARSED_STATS+="Files transferred : ${files}\n"
+    [[ -n "$sent"  ]] && PARSED_STATS+="Data transferred  : ${sent}\n"
+    [[ -n "$speed" ]] && PARSED_STATS+="Transfer rate     : ${speed}"
+    PARSED_STATS=$(echo -e "$PARSED_STATS")
+  else
+    PARSED_STATS=""
+  fi
+}
+
+# ── SMTP send ─────────────────────────────────────────────────────────────────
+send_smtp_email() {
+  local subject="$1"
+  local body_plain="$2"
+  local body_html="$3"
+  local boundary="dispatch_boundary_${TIMESTAMP}"
+
+  local tmp_mail
+  tmp_mail=$(mktemp /tmp/dispatch-mail.XXXXXX)
+
+  if $HTML_EMAIL; then
+    cat > "$tmp_mail" <<EOF
+From: ${SCRIPT_NAME} <${SMTP_FROM}>
+To: ${SMTP_TO}
+Subject: ${subject}
+Date: $(date -R)
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="${boundary}"
+
+--${boundary}
+Content-Type: text/plain; charset=UTF-8
+
+${body_plain}
+
+--${boundary}
+Content-Type: text/html; charset=UTF-8
+
+${body_html}
+
+--${boundary}--
+EOF
+  else
+    cat > "$tmp_mail" <<EOF
+From: ${SCRIPT_NAME} <${SMTP_FROM}>
+To: ${SMTP_TO}
+Subject: ${subject}
+Date: $(date -R)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+${body_plain}
+EOF
+  fi
+
+  local tls_flag=""
+  case "$SMTP_TLS" in
+    starttls) tls_flag="--ssl-reqd" ;;
+    ssl)      tls_flag="--ssl"      ;;
+    none)     tls_flag=""           ;;
+  esac
+
+  local rcpt_flags=()
+  IFS=',' read -ra _recipients <<< "$SMTP_TO"
+  for _r in "${_recipients[@]}"; do
+    _r="${_r// /}"
+    [[ -n "$_r" ]] && rcpt_flags+=(--mail-rcpt "$_r")
+  done
+
+  local curl_exit=0
+  curl --silent --show-error --connect-timeout 30 \
+    --url "smtp://${SMTP_HOST}:${SMTP_PORT}" \
+    ${tls_flag} \
+    --user "${SMTP_USER}:${SMTP_PASS}" \
+    --mail-from "${SMTP_FROM}" \
+    "${rcpt_flags[@]}" \
+    --upload-file "$tmp_mail" || curl_exit=$?
+
+  rm -f "$tmp_mail"
+
+  if [[ "$curl_exit" -eq 0 ]]; then
+    echo -e "${GREEN}[✔] Email sent to: ${SMTP_TO}${RESET}"
+  else
+    echo -e "${YELLOW}[⚠] SMTP delivery failed (curl exit: ${curl_exit})${RESET}"
+    echo -e "${YELLOW}[⚠] Debug: curl -v --url smtp://${SMTP_HOST}:${SMTP_PORT} ${tls_flag} --user '${SMTP_USER}:<pass>'${RESET}"
+  fi
+}
+
+# ── Webhook dispatch ──────────────────────────────────────────────────────────
+dispatch_webhook() {
+  local event="$1"
+  [[ -z "$WEBHOOK_URL" ]] && return 0
+
+  local fire=false
+  case "$WEBHOOK_ON" in
+    always)  fire=true ;;
+    failure) [[ "$event" == "failed" || "$event" == "interrupted" ]] && fire=true ;;
+    success) [[ "$event" == "success" || "$event" == "warnings"   ]] && fire=true ;;
+  esac
+  $fire || return 0
+
+  local icon status_text
+  case "$event" in
+    success)     icon="✅";  status_text="SUCCESS" ;;
+    warnings)    icon="⚠️";  status_text="SUCCESS (with warnings)" ;;
+    failed)      icon="❌";  status_text="FAILED (exit: ${RSYNC_EXIT:-?})" ;;
+    interrupted) icon="🛑";  status_text="INTERRUPTED" ;;
+    *)           icon="ℹ️";  status_text="$event" ;;
+  esac
+
+  local dry_note=""
+  $IS_DRY_RUN && dry_note=" [DRY RUN]"
+
+  local src_esc dest_esc host_esc
+  src_esc=$(echo "$SRC_ARG"  | sed 's/\\/\\\\/g; s/"/\\"/g')
+  dest_esc=$(echo "$DEST_ARG" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  host_esc=$(hostname -s     | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+  local payload
+  payload=$(printf '{"text":"%s Dispatch%s: %s\nHost: %s\nSource: %s\nDest: %s\nDuration: %s\nAttempt: %s/%s"}' \
+    "$icon" "$dry_note" "$status_text" \
+    "$host_esc" "$src_esc" "$dest_esc" \
+    "${ELAPSED_FMT:-in progress}" \
+    "${ATTEMPT:-1}" "$((RETRY_COUNT + 1))")
+
+  local webhook_exit=0
+  curl --silent --show-error --connect-timeout 10 \
+    --max-time 15 \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Title: Dispatch ${status_text}" \
+    -H "Tags: rsync,backup" \
+    -d "$payload" \
+    "$WEBHOOK_URL" >/dev/null || webhook_exit=$?
+
+  if [[ "$webhook_exit" -eq 0 ]]; then
+    echo -e "${GREEN}[✔] Webhook delivered to: ${WEBHOOK_URL}${RESET}"
+  else
+    echo -e "${YELLOW}[⚠] Webhook delivery failed (curl exit: ${webhook_exit}): ${WEBHOOK_URL}${RESET}"
+  fi
+}
+
+# ── Dead man's switch / heartbeat ping ───────────────────────────────────────
+dispatch_ping() {
+  local event="$1"
+  [[ -z "$PING_URL" ]] && return 0
+
+  if [[ "$event" != "success" && "$event" != "warnings" ]]; then
+    $QUIET || echo -e "${CYAN}[$(ts)]${RESET} Ping skipped — event '${event}' is not a success."
+    return 0
+  fi
+
+  local ping_exit=0
+  curl --silent --show-error --max-time 10 \
+    "$PING_URL" >/dev/null || ping_exit=$?
+
+  if [[ "$ping_exit" -eq 0 ]]; then
+    echo -e "${GREEN}[✔] Heartbeat pinged: ${PING_URL}${RESET}"
+  else
+    echo -e "${YELLOW}[⚠] Heartbeat ping failed (curl exit: ${ping_exit}): ${PING_URL}${RESET}"
+  fi
+}
+
+# ── Build and dispatch email ──────────────────────────────────────────────────
+dispatch_email() {
+  local event="$1"
+  local subject_tag icon status_line color
+
+  case "$event" in
+    start)
+      subject_tag="STARTED";  icon=">>"; status_line="Sync has started"; color="#2196F3" ;;
+    success)
+      subject_tag="SUCCESS";  icon="OK"; status_line="Sync completed successfully"; color="#4CAF50" ;;
+    warnings)
+      subject_tag="WARNINGS"; icon="!!"; status_line="Sync completed with warnings (exit 24 -- files vanished mid-transfer)"; color="#FF9800" ;;
+    failed)
+      subject_tag="FAILED";   icon="XX"; status_line="Sync FAILED (rsync exit code: ${RSYNC_EXIT:-?})"; color="#F44336" ;;
+    interrupted)
+      subject_tag="INTERRUPTED"; icon="!!"; status_line="Sync was interrupted by signal"; color="#9C27B0" ;;
+  esac
+
+  local dry_tag=""
+  $IS_DRY_RUN && dry_tag=" [DRY RUN]"
+
+  local src_dest_tag=""
+  if [[ -n "$SRC_ARG" && -n "$DEST_ARG" ]]; then
+    src_dest_tag=" — ${SRC_ARG} → ${DEST_ARG}"
+  elif [[ -n "$DEST_ARG" ]]; then
+    src_dest_tag=" → ${DEST_ARG}"
+  fi
+
+  local subject="[dispatch]${dry_tag} ${subject_tag}${src_dest_tag} ($(hostname -s), ${ELAPSED_FMT:-in progress})"
+
+  local output_section=""
+  if [[ -s "$STATS_TMP" ]]; then
+    output_section="---- rsync output ----
+$(cat "$STATS_TMP")
+-----------------------"
+  else
+    output_section="(no output captured)"
+  fi
+
+  local plain_body
+  plain_body=$(cat <<EOF
+${SCRIPT_NAME} v${VERSION} — Sync Report
+$( printf '=%.0s' {1..45} )
+Status      : [${icon}] ${status_line}${dry_tag}
+${PARSED_STATS:-}
+Source      : ${SRC_ARG:-n/a}
+Destination : ${DEST_ARG:-n/a}
+Arguments   : ${RSYNC_ARGS[*]}
+Hostname    : $(hostname -f)
+Real rsync  : ${RSYNC_BIN}
+Started     : ${START_DATE}
+Finished    : ${END_DATE:-in progress}
+Duration    : ${ELAPSED_FMT:-in progress}
+Attempt     : ${ATTEMPT:-1} / $((RETRY_COUNT + 1))
+Log file    : ${LOG_FILE:-disabled}
+Dry run     : ${IS_DRY_RUN}
+SMTP notify : ${NOTIFY_ON}
+
+${output_section}
+
+Sent by ${SCRIPT_NAME} v${VERSION} on $(hostname -f)
+EOF
+)
+
+  local rsync_html_output=""
+  if [[ -s "$STATS_TMP" ]]; then
+    # sed pipeline: escape HTML entities, then convert each newline to <br>
+    # so email clients render line breaks without relying on white-space:pre-wrap
+    local _escaped_output
+    _escaped_output=$(sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$STATS_TMP" | sed 's/$/<br>/')
+    rsync_html_output="<div style='background:#1e1e1e;color:#d4d4d4;padding:16px;border-radius:6px;font-size:12px;overflow-x:auto;font-family:monospace;line-height:1.5;'>${_escaped_output}</div>"
+  else
+    rsync_html_output="<p style='color:#888;font-style:italic;'>No output captured.</p>"
+  fi
+
+  local dry_banner=""
+  $IS_DRY_RUN && dry_banner="<div style='background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px 16px;margin-bottom:20px;color:#856404;font-weight:bold;'>⚠ DRY RUN — No files were actually transferred</div>"
+
+  local stats_html=""
+  [[ -n "${PARSED_STATS:-}" ]] && stats_html="<div style='background:#f5f5f5;border-radius:6px;padding:12px 16px;margin:16px 0;font-family:monospace;font-size:13px;white-space:pre;'>${PARSED_STATS}</div>"
+
+  local html_body
+  html_body=$(cat <<EOF
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f5;padding:30px 0;">
+    <tr><td align="center">
+      <table width="620" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+        <tr><td style="background:${color};padding:28px 32px;">
+          <p style="margin:0;color:rgba(255,255,255,0.85);font-size:12px;text-transform:uppercase;letter-spacing:1px;">${SCRIPT_NAME} v${VERSION}</p>
+          <h1 style="margin:6px 0 0;color:#ffffff;font-size:24px;font-weight:700;">${icon} ${status_line}</h1>
+        </td></tr>
+        <tr><td style="padding:28px 32px;">
+          ${dry_banner}
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:20px;">
+            <tr style="background:#f8f9fa;">
+              <td style="padding:10px 14px;font-size:12px;color:#666;width:130px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Source</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${SRC_ARG:-n/a}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Destination</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${DEST_ARG:-n/a}</td>
+            </tr>
+            <tr style="background:#f8f9fa;">
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Hostname</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">$(hostname -f)</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Arguments</td>
+              <td style="padding:10px 14px;font-size:12px;color:#1a1a1a;font-family:monospace;word-break:break-all;">${RSYNC_ARGS[*]}</td>
+            </tr>
+            <tr style="background:#f8f9fa;">
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Started</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${START_DATE}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Finished</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${END_DATE:-in progress}</td>
+            </tr>
+            <tr style="background:#f8f9fa;">
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Duration</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${ELAPSED_FMT:-in progress}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Attempt</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${ATTEMPT:-1} of $((RETRY_COUNT + 1))</td>
+            </tr>
+            <tr style="background:#f8f9fa;">
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Log file</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${LOG_FILE:-disabled}</td>
+            </tr>
+            <tr>
+              <td style="padding:10px 14px;font-size:12px;color:#666;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Real rsync</td>
+              <td style="padding:10px 14px;font-size:13px;color:#1a1a1a;font-family:monospace;">${RSYNC_BIN}</td>
+            </tr>
+          </table>
+          ${stats_html}
+          <h3 style="font-size:13px;color:#444;text-transform:uppercase;letter-spacing:0.5px;margin:24px 0 8px;">rsync Output</h3>
+          ${rsync_html_output}
+        </td></tr>
+        <tr><td style="background:#f8f9fa;padding:16px 32px;border-top:1px solid #eee;">
+          <p style="margin:0;font-size:11px;color:#999;">Sent by <strong>${SCRIPT_NAME} v${VERSION}</strong> on $(hostname -f) at $(date -R)</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>
+EOF
+)
+
+  if $SMTP_ENABLED; then
+    $QUIET || echo -e "${CYAN}[$(ts)]${RESET} Dispatching ${event} email to: ${SMTP_TO}..."
+    send_smtp_email "$subject" "$plain_body" "$html_body"
+  fi
+}
+
+# ── Signal trap ───────────────────────────────────────────────────────────────
+INTERRUPTED=false
+handle_signal() {
+  INTERRUPTED=true
+  echo ""
+  echo -e "${YELLOW}[⚠] Signal received -- rsync interrupted.${RESET}"
+  END_DATE="$(ts)"
+  local end_epoch
+  end_epoch=$(date +%s)
+  ELAPSED=$(( end_epoch - START_TIME ))
+  ELAPSED_FMT=$(printf '%02dh:%02dm:%02ds' $(( ELAPSED/3600 )) $(( (ELAPSED%3600)/60 )) $(( ELAPSED%60 )))
+  RSYNC_EXIT=130
+  parse_rsync_stats
+  dispatch_email "interrupted"
+  dispatch_webhook "interrupted"
+  release_lock
+  exit 130
+}
+
+trap handle_signal SIGINT SIGTERM
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+START_TIME=$(date +%s)
+START_DATE="$(ts)"
+END_DATE=""
+ELAPSED_FMT=""
+RSYNC_EXIT=0
+PARSED_STATS=""
+ATTEMPT=1
+
+# ── Acquire lock ──────────────────────────────────────────────────────────────
+acquire_lock
+
+# ── Display header ────────────────────────────────────────────────────────────
+LOG_LABEL="$( $LOG_ENABLED && echo "$LOG_FILE" || echo "disabled" )"
+SMTP_LABEL="$( $SMTP_ENABLED && echo "enabled (notify: ${NOTIFY_ON})" || echo "disabled" )"
+WEBHOOK_LABEL="$( [[ -n "$WEBHOOK_URL" ]] && echo "${WEBHOOK_URL} (on: ${WEBHOOK_ON})" || echo "disabled" )"
+PING_LABEL="$( [[ -n "$PING_URL" ]] && echo "${PING_URL}" || echo "disabled" )"
+
+banner
+$QUIET || cat << 'ASCIIART'
+║                                                                           ║
+║   ██████╗  ██╗ ███████╗ ██████╗   █████╗  ████████╗  ██████╗ ██╗  ██╗     ║
+║   ██╔══██╗ ██║ ██╔════╝ ██╔══██╗ ██╔══██╗ ╚══██╔══╝ ██╔════╝ ██║  ██║     ║
+║   ██║  ██║ ██║ ███████╗ ██████╔╝ ███████║    ██║    ██║      ███████║     ║
+║   ██║  ██║ ██║ ╚════██║ ██╔═══╝  ██╔══██║    ██║    ██║      ██╔══██║     ║
+║   ██████╔╝ ██║ ███████║ ██║      ██║  ██║    ██║    ╚██████╗ ██║  ██║     ║
+║   ╚═════╝  ╚═╝ ╚══════╝ ╚═╝      ╚═╝  ╚═╝    ╚═╝     ╚═════╝ ╚═╝  ╚═╝     ║
+║                                                                           ║
+║                   ◄──── notify · rsync · deliver ────►                    ║
+║                                                                           ║
+ASCIIART
+$QUIET || printf "║%s Dispatch · Smart rsync notifications · v%-6s %s║\n" "         " "${VERSION}" "        "
+$QUIET || echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+banner
+log "Real rsync  : $RSYNC_BIN"
+log "Source      : ${SRC_ARG:-n/a}"
+log "Destination : ${DEST_ARG:-n/a}"
+log "Arguments   : ${RSYNC_ARGS[*]}"
+log "Dry run     : $IS_DRY_RUN"
+log "Log file    : $LOG_LABEL"
+log "SMTP        : $SMTP_LABEL"
+log "Webhook     : $WEBHOOK_LABEL"
+log "Ping URL    : $PING_LABEL"
+[[ -n "$PRE_HOOK"  ]] && log "Pre-hook    : $PRE_HOOK"
+[[ -n "$POST_HOOK" ]] && log "Post-hook   : $POST_HOOK"
+[[ "$RETRY_COUNT" -gt 0 ]] && log "Retry       : up to ${RETRY_COUNT}x with ${RETRY_DELAY}s delay"
+banner
+echo ""
+
+# ── Pre-hook ──────────────────────────────────────────────────────────────────
+if [[ -n "$PRE_HOOK" ]]; then
+  log "Running pre-hook: $PRE_HOOK"
+  if "$PRE_HOOK"; then
+    echo -e "${GREEN}[✔] Pre-hook completed.${RESET}"
+  else
+    echo -e "${YELLOW}[⚠] Pre-hook exited non-zero -- continuing with rsync anyway.${RESET}"
+  fi
+fi
+
+# ── Start notification ────────────────────────────────────────────────────────
+if $SMTP_ENABLED && $NOTIFY_START; then
+  dispatch_email "start"
+fi
+
+# ── Write run header ──────────────────────────────────────────────────────────
+{
+  echo "${SCRIPT_NAME} v${VERSION} run -- $(date)"
+  echo "Binary      : $RSYNC_BIN"
+  echo "Source      : ${SRC_ARG:-n/a}"
+  echo "Destination : ${DEST_ARG:-n/a}"
+  echo "Arguments   : ${RSYNC_ARGS[*]}"
+  echo "Dry run     : $IS_DRY_RUN"
+  echo "SMTP        : $SMTP_LABEL"
+  echo "Log file    : $LOG_LABEL"
+  echo "============================================"
+} | tee_output
+
+# ── rsync execution with retry ────────────────────────────────────────────────
+RSYNC_EXIT=1
+
+for (( ATTEMPT=1; ATTEMPT <= RETRY_COUNT + 1; ATTEMPT++ )); do
+  if [[ $ATTEMPT -gt 1 ]]; then
+    echo -e "${YELLOW}[⚠] Retry attempt ${ATTEMPT}/$((RETRY_COUNT + 1)) in ${RETRY_DELAY}s...${RESET}"
+    sleep "$RETRY_DELAY"
+    write_output ""
+    write_output "============================================"
+    write_output "RETRY ATTEMPT ${ATTEMPT} -- $(date)"
+    write_output "============================================"
+  fi
+
+  set +e
+  "$RSYNC_BIN" "${RSYNC_ARGS[@]}" 2>&1 | tee_output
+  RSYNC_EXIT="${PIPESTATUS[0]}"
+  set -e
+
+  if [[ "$RSYNC_EXIT" -eq 0 || "$RSYNC_EXIT" -eq 24 ]]; then
+    break
+  fi
+
+  if [[ $ATTEMPT -le $RETRY_COUNT ]]; then
+    echo -e "${YELLOW}[⚠] rsync failed (exit ${RSYNC_EXIT}) -- will retry...${RESET}"
+    write_output "rsync exit ${RSYNC_EXIT} -- retry ${ATTEMPT}/${RETRY_COUNT} scheduled"
+  fi
+done
+
+# ── Timing ────────────────────────────────────────────────────────────────────
+END_TIME=$(date +%s)
+END_DATE="$(ts)"
+ELAPSED=$(( END_TIME - START_TIME ))
+ELAPSED_FMT=$(printf '%02dh:%02dm:%02ds' $(( ELAPSED/3600 )) $(( (ELAPSED%3600)/60 )) $(( ELAPSED%60 )))
+
+# ── Parse stats ───────────────────────────────────────────────────────────────
+parse_rsync_stats
+
+# ── Determine event ───────────────────────────────────────────────────────────
+EVENT=""
+if [[ "$RSYNC_EXIT" -eq 0 ]]; then
+  EVENT="success"
+  echo -e "${GREEN}[✔] rsync completed successfully.${RESET}"
+elif [[ "$RSYNC_EXIT" -eq 24 ]]; then
+  EVENT="warnings"
+  echo -e "${YELLOW}[⚠] rsync completed with warnings (exit 24 -- some files vanished mid-transfer).${RESET}"
+else
+  EVENT="failed"
+  echo -e "${RED}[✘] rsync FAILED after $ATTEMPT attempt(s). Exit code: $RSYNC_EXIT${RESET}" >&2
+fi
+
+{
+  echo "============================================"
+  echo "Status      : ${EVENT^^}"
+  echo "Duration    : $ELAPSED_FMT"
+  echo "Attempts    : $ATTEMPT"
+  echo "Finished    : $END_DATE"
+  [[ -n "$PARSED_STATS" ]] && echo -e "$PARSED_STATS"
+  echo "============================================"
+} | tee_output
+
+# ── Post-hook ─────────────────────────────────────────────────────────────────
+if [[ -n "$POST_HOOK" ]]; then
+  log "Running post-hook: $POST_HOOK"
+  if RSYNC_EXIT_CODE="$RSYNC_EXIT" "$POST_HOOK"; then
+    echo -e "${GREEN}[✔] Post-hook completed.${RESET}"
+  else
+    echo -e "${YELLOW}[⚠] Post-hook exited non-zero.${RESET}"
+  fi
+fi
+
+# ── Log rotation ──────────────────────────────────────────────────────────────
+rotate_logs
+
+# ── SMTP dispatch ─────────────────────────────────────────────────────────────
+should_notify=false
+case "$NOTIFY_ON" in
+  always)   should_notify=true ;;
+  failure)  [[ "$EVENT" == "failed"   || "$EVENT" == "interrupted" ]] && should_notify=true ;;
+  success)  [[ "$EVENT" == "success"                               ]] && should_notify=true ;;
+  warnings) [[ "$EVENT" == "warnings"                              ]] && should_notify=true ;;
+esac
+
+if $SMTP_ENABLED && $should_notify; then
+  dispatch_email "$EVENT"
+elif $SMTP_ENABLED && ! $should_notify; then
+  $QUIET || echo -e "${CYAN}[$(ts)]${RESET} SMTP enabled but notify=${NOTIFY_ON} — skipping email for '${EVENT}' event."
+else
+  $QUIET || echo -e "${CYAN}[$(ts)]${RESET} SMTP disabled — skipping email notification."
+fi
+
+# ── Webhook dispatch ──────────────────────────────────────────────────────────
+[[ -n "$WEBHOOK_URL" ]] && dispatch_webhook "$EVENT"
+
+# ── Heartbeat ping ────────────────────────────────────────────────────────────
+[[ -n "$PING_URL" ]] && dispatch_ping "$EVENT"
+
+# ── Release lock ──────────────────────────────────────────────────────────────
+release_lock
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+echo ""
+banner
+$LOG_ENABLED && log "Log saved to : $LOG_FILE" || true
+log "Done in      : $ELAPSED_FMT"
+banner
+echo ""
+
+exit "$RSYNC_EXIT"
