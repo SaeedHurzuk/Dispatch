@@ -20,7 +20,7 @@ IFS=$'\n\t'
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-WRAPPER_VERSION="1.0.1"
+WRAPPER_VERSION="1.0.2"
 INSTALL_DIR="/usr/local/bin"
 WRAPPER_NAME="rsync"
 WRAPPER_DST="${INSTALL_DIR}/${WRAPPER_NAME}"

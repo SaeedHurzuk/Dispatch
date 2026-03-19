@@ -173,7 +173,7 @@ sudo chmod +x /usr/local/bin/rsync
 
 ```bash
 rsync --version
-# Shows: Dispatch wrapper v1.0.1 + real rsync version below it
+# Shows: Dispatch wrapper v1.0.2 + real rsync version below it
 ```
 
 ### Update
