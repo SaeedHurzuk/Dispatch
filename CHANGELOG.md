@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.3] — 2026-03-20
+- **ASCII art fixed** — the ║ was incorrectly placed
+
 ## [1.0.2] — 2026-03-18
 - **ASCII art fixed** — the ║ was incorrectly placed
 
