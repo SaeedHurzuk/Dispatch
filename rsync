@@ -656,18 +656,15 @@ webhook_test() {
   local je_host
   je_host=$(json_escape "$(hostname -s)")
 
-  # Auto-detect the correct payload field for the target service
-  local field="text"
+  # Discord gets a flat string; everyone else gets structured JSON
+  local payload
   if [[ "$WEBHOOK_URL" == *"discord.com"* || "$WEBHOOK_URL" == *"discordapp.com"* ]]; then
-    field="content"
     log "Auto-detected: Discord (using \"content\" field)"
-  elif [[ "$WEBHOOK_URL" == *"slack.com"* ]]; then
-    log "Auto-detected: Slack (using \"text\" field)"
+    payload="{\"content\":\"🧪 Dispatch webhook test from ${je_host} — delivery confirmed!\"}"
   else
-    log "Format: generic — using \"text\" field (Slack-compatible)"
+    log "Format: structured JSON (result / host / source / destination / duration / attempt)"
+    payload="{\"result\":\"🧪 TEST\",\"host\":\"${je_host}\",\"source\":\"n/a\",\"destination\":\"n/a\",\"duration\":\"n/a\",\"attempt\":\"1/1\"}"
   fi
-
-  local payload="{\"${field}\":\"🧪 Dispatch webhook test from ${je_host} — delivery confirmed!\"}"
   echo ""
 
   local http_code webhook_exit=0
@@ -719,41 +716,30 @@ dispatch_webhook() {
   local dry_note=""
   $IS_DRY_RUN && dry_note=" [DRY RUN]"
 
-  # Use json_escape on every dynamic value before embedding in JSON.
-  # This prevents broken payloads from special chars in paths or hostnames,
-  # and properly escapes real newlines → \n (valid JSON).
-  local je_host je_src je_dest
+  # Escape every dynamic value individually — each becomes its own JSON field.
+  # This produces a structured, machine-parseable payload instead of a flat
+  # newline-joined string, making it easy to consume in automations and bots.
+  local je_result je_host je_src je_dest je_elapsed je_attempt
+  je_result=$(json_escape "${icon}${dry_note} ${status_text}")
   je_host=$(json_escape "$(hostname -s)")
   je_src=$(json_escape "${SRC_ARG:-n/a}")
   je_dest=$(json_escape "${DEST_ARG:-n/a}")
-  local je_elapsed
   je_elapsed=$(json_escape "${ELAPSED_FMT:-in progress}")
-  local je_attempt="${ATTEMPT:-1}/$((RETRY_COUNT + 1))"
-  local je_dry
-  je_dry=$(json_escape "$dry_note")
+  je_attempt=$(json_escape "${ATTEMPT:-1}/$((RETRY_COUNT + 1))")
 
-  # Build the human-readable message with real newlines, then escape the
-  # whole thing as one JSON string value.  This is the cleanest approach:
-  # write readable code, let json_escape handle the encoding.
-  local raw_msg="${icon}${je_dry} ${status_text}
-Host:     ${je_host}
-Source:   ${je_src}
-Dest:     ${je_dest}
-Duration: ${je_elapsed}
-Attempt:  ${je_attempt}"
-
-  local je_msg
-  je_msg=$(json_escape "$raw_msg")
-
-  # Auto-detect the correct payload field:
-  #   Discord  →  "content"
-  #   Slack / ntfy.sh / generic  →  "text"
-  local field="text"
+  # Build a structured JSON payload — one field per piece of data.
+  # Discord uses a single "content" field, so we fall back to a formatted
+  # string for Discord only.  Everyone else gets the structured object.
+  local payload
   if [[ "$WEBHOOK_URL" == *"discord.com"* || "$WEBHOOK_URL" == *"discordapp.com"* ]]; then
-    field="content"
+    # Discord only supports a single "content" string field
+    local discord_msg
+    discord_msg=$(json_escape "${icon}${dry_note} ${status_text}\nHost: $(hostname -s)\nSource: ${SRC_ARG:-n/a}\nDest: ${DEST_ARG:-n/a}\nDuration: ${ELAPSED_FMT:-in progress}\nAttempt: ${ATTEMPT:-1}/$((RETRY_COUNT + 1))")
+    payload="{\"content\":\"${discord_msg}\"}"
+  else
+    payload=$(printf '{"result":"%s","host":"%s","source":"%s","destination":"%s","duration":"%s","attempt":"%s"}' \
+      "$je_result" "$je_host" "$je_src" "$je_dest" "$je_elapsed" "$je_attempt")
   fi
-
-  local payload="{\"${field}\":\"${je_msg}\"}"
 
   # Capture the HTTP status code.  curl exits 0 even on 4xx/5xx responses,
   # so we must inspect the code to detect silent rejections (e.g. Discord
