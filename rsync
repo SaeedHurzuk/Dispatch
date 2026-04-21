@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Dispatch — Production-grade transparent rsync wrapper
-# Version: 1.0.3
+# Version: 1.1.0
 #
 # Features:
 #   - Transparent drop-in replacement for rsync (all args pass through)
 #   - SMTP email notifications via curl (HTML + plain text)
 #   - Notify on: always | failure | success | warnings
 #   - Optional start notification email
-#   - Webhook support (Slack, Discord, ntfy.sh, generic HTTP POST)
+#   - Webhook support (Slack, Discord, ntfy.sh, generic HTTP POST — auto-detected)
+#   - Webhook test without running a sync (--webhook-test)
 #   - Dead man's switch / heartbeat ping (Healthchecks.io, Uptime Kuma)
 #   - SMTP connection test without running a sync (--smtp-test)
 #   - Retry logic with configurable attempts and backoff delay
@@ -47,7 +48,8 @@
 #   --post-hook=/path      Script to run after rsync
 #   --no-lock              Disable lock file, allow concurrent runs
 #   --webhook=URL          POST notification to URL on completion
-#   --webhook-on=EVENT     When to fire webhook: always|failure|success (default: always)
+#   --webhook-on=EVENT     When to fire webhook: always|failure|success|warnings (default: always)
+#   --webhook-test         Test webhook delivery and exit (no sync runs)
 #   --ping-url=URL         GET this URL on success — dead man's switch / heartbeat
 #   --quiet                Suppress wrapper header/footer output
 #   --upgrade              Self-update Dispatch to the latest version
@@ -67,7 +69,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-readonly VERSION="1.0.3"
+readonly VERSION="1.1.0"
 readonly SCRIPT_NAME="dispatch"
 
 # =============================================================================
@@ -92,7 +94,7 @@ NOTIFY_START=false                # Send email when sync starts
 
 # ── Webhooks ──────────────────────────────────────────────────────────────────
 WEBHOOK_URL=""                    # POST to this URL on completion (Slack, Discord, ntfy.sh...)
-WEBHOOK_ON="always"               # always | failure | success
+WEBHOOK_ON="always"               # always | failure | success | warnings
 
 # ── Dead man's switch ─────────────────────────────────────────────────────────
 PING_URL=""                       # GET this URL on success only (Healthchecks.io, Uptime Kuma...)
@@ -226,7 +228,8 @@ ${BOLD}Wrapper Options:${RESET}
   --post-hook=/path        Run this script after rsync completes
   --no-lock                Disable lock file, allow concurrent runs
   --webhook=URL            POST notification to URL on completion
-  --webhook-on=EVENT       When to fire webhook: always|failure|success (default: always)
+  --webhook-on=EVENT       When to fire webhook: always|failure|success|warnings (default: always)
+  --webhook-test           Test webhook delivery and exit — no sync runs
   --ping-url=URL           GET this URL on success — dead man's switch / heartbeat
   --quiet                  Suppress wrapper header/footer (rsync output unaffected)
   --rsync-help             Show the real rsync binary's own --help output
@@ -266,6 +269,7 @@ RSYNC_ARGS=()
 IS_DRY_RUN=false
 _SMTP_TEST=false
 _DO_UPGRADE=false
+_WEBHOOK_TEST=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -287,6 +291,7 @@ for arg in "$@"; do
     --no-lock)          NO_LOCK=true ;;
     --webhook=*)        WEBHOOK_URL="${arg#--webhook=}" ;;
     --webhook-on=*)     WEBHOOK_ON="${arg#--webhook-on=}" ;;
+    --webhook-test)     _WEBHOOK_TEST=true ;;
     --ping-url=*)       PING_URL="${arg#--ping-url=}" ;;
     --quiet)            QUIET=true ;;
     --rsync-help)       exec "$RSYNC_BIN" --help ;;
@@ -361,6 +366,11 @@ if $_SMTP_TEST; then
   exit $?
 fi
 
+if $_WEBHOOK_TEST; then
+  webhook_test
+  exit $?
+fi
+
 # ── Self-upgrade ──────────────────────────────────────────────────────────────
 do_upgrade() {
   local installer_url="https://raw.githubusercontent.com/SaeedHurzuk/Dispatch/refs/heads/main/install.sh"
@@ -432,8 +442,8 @@ case "$NOTIFY_ON" in
 esac
 
 case "$WEBHOOK_ON" in
-  always|failure|success) ;;
-  *) die "Invalid --webhook-on value: '$WEBHOOK_ON'. Use: always | failure | success" ;;
+  always|failure|success|warnings) ;;
+  *) die "Invalid --webhook-on value: '$WEBHOOK_ON'. Use: always | failure | success | warnings" ;;
 esac
 
 # ── Dependency check ──────────────────────────────────────────────────────────
@@ -623,6 +633,66 @@ EOF
   fi
 }
 
+# ── JSON string escape ────────────────────────────────────────────────────────
+# Safely escapes a value for embedding inside a JSON double-quoted string.
+# Handles backslash, double-quote, and the common JSON control characters.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"    # \  →  \\  (must be first)
+  s="${s//\"/\\\"}"    # "  →  \"
+  s="${s//$'\n'/\\n}"  # newline → \n
+  s="${s//$'\r'/\\r}"  # CR      → \r
+  s="${s//$'\t'/\\t}"  # tab     → \t
+  printf '%s' "$s"
+}
+
+# ── Webhook test ──────────────────────────────────────────────────────────────
+webhook_test() {
+  [[ -z "$WEBHOOK_URL" ]] && die "--webhook-test requires --webhook=URL to be set (or WEBHOOK_URL in config)"
+
+  echo ""
+  log "Testing webhook delivery to: ${WEBHOOK_URL}"
+
+  local je_host
+  je_host=$(json_escape "$(hostname -s)")
+
+  # Auto-detect the correct payload field for the target service
+  local field="text"
+  if [[ "$WEBHOOK_URL" == *"discord.com"* || "$WEBHOOK_URL" == *"discordapp.com"* ]]; then
+    field="content"
+    log "Auto-detected: Discord (using \"content\" field)"
+  elif [[ "$WEBHOOK_URL" == *"slack.com"* ]]; then
+    log "Auto-detected: Slack (using \"text\" field)"
+  else
+    log "Format: generic — using \"text\" field (Slack-compatible)"
+  fi
+
+  local payload="{\"${field}\":\"🧪 Dispatch webhook test from ${je_host} — delivery confirmed!\"}"
+  echo ""
+
+  local http_code webhook_exit=0
+  http_code=$(curl --silent --show-error --connect-timeout 10 --max-time 15 \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Title: Dispatch webhook test" \
+    -H "Tags: rsync,test" \
+    -d "$payload" \
+    -w "%{http_code}" \
+    -o /dev/null \
+    "$WEBHOOK_URL") || webhook_exit=$?
+
+  echo ""
+  if [[ "$webhook_exit" -eq 0 && "$http_code" =~ ^2 ]]; then
+    echo -e "${GREEN}[✔] Webhook test passed (HTTP ${http_code}) — check your endpoint for the test message.${RESET}"
+  else
+    echo -e "${RED}[✘] Webhook test failed (curl exit: ${webhook_exit}, HTTP: ${http_code:-n/a})${RESET}" >&2
+    echo -e "${YELLOW}[⚠] Payload sent:${RESET}  $payload"
+    echo -e "${YELLOW}[⚠] Reproduce:${RESET}     curl -v -X POST -H 'Content-Type: application/json' -d '$payload' '$WEBHOOK_URL'"
+  fi
+  echo ""
+  return "$webhook_exit"
+}
+
 # ── Webhook dispatch ──────────────────────────────────────────────────────────
 dispatch_webhook() {
   local event="$1"
@@ -630,9 +700,10 @@ dispatch_webhook() {
 
   local fire=false
   case "$WEBHOOK_ON" in
-    always)  fire=true ;;
-    failure) [[ "$event" == "failed" || "$event" == "interrupted" ]] && fire=true ;;
-    success) [[ "$event" == "success" || "$event" == "warnings"   ]] && fire=true ;;
+    always)   fire=true ;;
+    failure)  [[ "$event" == "failed"   || "$event" == "interrupted" ]] && fire=true ;;
+    success)  [[ "$event" == "success"  || "$event" == "warnings"    ]] && fire=true ;;
+    warnings) [[ "$event" == "warnings"                               ]] && fire=true ;;
   esac
   $fire || return 0
 
@@ -648,32 +719,61 @@ dispatch_webhook() {
   local dry_note=""
   $IS_DRY_RUN && dry_note=" [DRY RUN]"
 
-  local src_esc dest_esc host_esc
-  src_esc=$(echo "$SRC_ARG"  | sed 's/\\/\\\\/g; s/"/\\"/g')
-  dest_esc=$(echo "$DEST_ARG" | sed 's/\\/\\\\/g; s/"/\\"/g')
-  host_esc=$(hostname -s     | sed 's/\\/\\\\/g; s/"/\\"/g')
+  # Use json_escape on every dynamic value before embedding in JSON.
+  # This prevents broken payloads from special chars in paths or hostnames,
+  # and properly escapes real newlines → \n (valid JSON).
+  local je_host je_src je_dest
+  je_host=$(json_escape "$(hostname -s)")
+  je_src=$(json_escape "${SRC_ARG:-n/a}")
+  je_dest=$(json_escape "${DEST_ARG:-n/a}")
+  local je_elapsed
+  je_elapsed=$(json_escape "${ELAPSED_FMT:-in progress}")
+  local je_attempt="${ATTEMPT:-1}/$((RETRY_COUNT + 1))"
+  local je_dry
+  je_dry=$(json_escape "$dry_note")
 
-  local payload
-  payload=$(printf '{"text":"%s Dispatch%s: %s\nHost: %s\nSource: %s\nDest: %s\nDuration: %s\nAttempt: %s/%s"}' \
-    "$icon" "$dry_note" "$status_text" \
-    "$host_esc" "$src_esc" "$dest_esc" \
-    "${ELAPSED_FMT:-in progress}" \
-    "${ATTEMPT:-1}" "$((RETRY_COUNT + 1))")
+  # Build the human-readable message with real newlines, then escape the
+  # whole thing as one JSON string value.  This is the cleanest approach:
+  # write readable code, let json_escape handle the encoding.
+  local raw_msg="${icon}${je_dry} ${status_text}
+Host:     ${je_host}
+Source:   ${je_src}
+Dest:     ${je_dest}
+Duration: ${je_elapsed}
+Attempt:  ${je_attempt}"
 
-  local webhook_exit=0
-  curl --silent --show-error --connect-timeout 10 \
-    --max-time 15 \
+  local je_msg
+  je_msg=$(json_escape "$raw_msg")
+
+  # Auto-detect the correct payload field:
+  #   Discord  →  "content"
+  #   Slack / ntfy.sh / generic  →  "text"
+  local field="text"
+  if [[ "$WEBHOOK_URL" == *"discord.com"* || "$WEBHOOK_URL" == *"discordapp.com"* ]]; then
+    field="content"
+  fi
+
+  local payload="{\"${field}\":\"${je_msg}\"}"
+
+  # Capture the HTTP status code.  curl exits 0 even on 4xx/5xx responses,
+  # so we must inspect the code to detect silent rejections (e.g. Discord
+  # returning 400 because the wrong field name was used).
+  local http_code webhook_exit=0
+  http_code=$(curl --silent --show-error --connect-timeout 10 --max-time 15 \
     -X POST \
     -H "Content-Type: application/json" \
     -H "Title: Dispatch ${status_text}" \
     -H "Tags: rsync,backup" \
     -d "$payload" \
-    "$WEBHOOK_URL" >/dev/null || webhook_exit=$?
+    -w "%{http_code}" \
+    -o /dev/null \
+    "$WEBHOOK_URL") || webhook_exit=$?
 
-  if [[ "$webhook_exit" -eq 0 ]]; then
-    echo -e "${GREEN}[✔] Webhook delivered to: ${WEBHOOK_URL}${RESET}"
+  if [[ "$webhook_exit" -eq 0 && "$http_code" =~ ^2 ]]; then
+    echo -e "${GREEN}[✔] Webhook delivered (HTTP ${http_code}): ${WEBHOOK_URL}${RESET}"
   else
-    echo -e "${YELLOW}[⚠] Webhook delivery failed (curl exit: ${webhook_exit}): ${WEBHOOK_URL}${RESET}"
+    echo -e "${YELLOW}[⚠] Webhook delivery failed (curl exit: ${webhook_exit}, HTTP: ${http_code:-n/a}): ${WEBHOOK_URL}${RESET}"
+    echo -e "${YELLOW}[⚠] Debug: curl -v -X POST -H 'Content-Type: application/json' -d '${payload}' '${WEBHOOK_URL}'${RESET}"
   fi
 }
 

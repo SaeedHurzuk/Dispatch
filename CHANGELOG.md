@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] — 2026-04-21
+
+### Fixed
+- **Webhook payload returning `null`** — the root cause was `curl` exiting 0 even on
+  HTTP 4xx/5xx responses, meaning silent rejections were reported as successful deliveries.
+  The fix captures the HTTP status code with `-w "%{http_code}"` and checks for a `2xx`
+  response before reporting success. Additionally, the old `>/dev/null` discarded any
+  error body from the server, making debugging impossible.
+- **Discord webhooks silently rejected** — Discord requires `{"content":"..."}` not
+  `{"text":"..."}`. The old code always used `"text"`, causing Discord to return HTTP 400
+  which curl reported as success (see above). Dispatch now auto-detects Discord URLs
+  and switches the payload field name automatically.
+- **`--webhook-on=warnings` rejected as invalid** — the argument validator only accepted
+  `always|failure|success` for `--webhook-on`, but `--notify=warnings` has always worked.
+  The `warnings` value is now accepted and correctly fires the webhook on rsync exit 24.
+
+### Added
+- **`json_escape()` helper** — all dynamic values (hostname, source, destination, status)
+  are now safely escaped before embedding in JSON. Handles backslash, double-quote, and
+  control characters (`\n`, `\r`, `\t`). Replaces the fragile `sed` chain that only
+  escaped `\` and `"` and could produce invalid JSON from paths with special characters.
+- **`--webhook-test` flag** — test webhook delivery without running a sync, mirroring
+  `--smtp-test`. Reports the HTTP status code, shows the exact payload sent, and prints
+  a ready-to-paste `curl -v` debug command on failure.
+- **HTTP status code shown in webhook output** — success and failure messages now include
+  the HTTP response code (e.g. `[✔] Webhook delivered (HTTP 200)`) so silent rejections
+  are immediately visible.
+- **Discord auto-detection** — webhook URLs containing `discord.com` or `discordapp.com`
+  automatically use `{"content":"..."}` instead of `{"text":"..."}`.
+- **Debug `curl -v` command printed on webhook failure** — the exact command needed to
+  reproduce the request is printed on failure, including the actual payload that was sent.
+
+---
+
+
 ## [1.0.3] — 2026-03-20
 - **ASCII art fixed** — the ║ was incorrectly placed
 
