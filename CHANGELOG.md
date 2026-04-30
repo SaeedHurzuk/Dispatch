@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] — 2026-04-30
+
+### Added
+- **`--webhook-header=Name: Value`** — attach arbitrary custom HTTP headers to every
+  webhook request. The flag is repeatable, so multiple headers can be supplied in a
+  single invocation:
+  ```
+  rsync --webhook=https://example.com/hook \
+        --webhook-header="X-Backup-Signature: HMAC-SHA256-TOKEN" \
+        --webhook-header="Authorization: Bearer mytoken" \
+        -avhr /src/ /dst/
+  ```
+  Headers can also be set permanently via `WEBHOOK_HEADERS=("Name: Value")` in
+  `/etc/dispatch.conf` or `~/.dispatch.conf`.
+- **`--webhook-secret=SECRET`** — automatically computes an HMAC-SHA256 signature of
+  the exact JSON payload being sent and attaches it as the
+  `X-Backup-Signature: HMAC-SHA256=<hex-digest>` header. The secret never appears in
+  any log output or debug commands (shown as `<computed>`). Requires `openssl` (falls
+  back to `sha256hmac` if available; warns and skips signing otherwise).
+- **`build_webhook_header_flags()` internal helper** — assembles curl `-H` flags from
+  `WEBHOOK_HEADERS` plus the HMAC signature when `WEBHOOK_SECRET` is set. Used by both
+  `dispatch_webhook()` and `webhook_test()` so header behaviour is identical in tests
+  and real runs.
+- **`webhook_sign()` internal helper** — computes `HMAC-SHA256` of a payload string
+  using `openssl dgst` with a `sha256hmac` fallback.
+- **Startup header now shows webhook signing status** — two new log lines appear when a
+  webhook URL is configured: `Wbhk headers` (lists any custom headers) and
+  `Wbhk signing` (`set (HMAC-SHA256)` or `not set`).
+- **`--webhook-test` respects new flags** — the test command now sends custom headers
+  and the HMAC signature exactly as a real delivery would, and prints a sanitised
+  reproduce command (secret masked as `<computed>`).
+
+---
+
 ## [1.1.0] — 2026-04-21
 
 ### Fixed

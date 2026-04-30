@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Dispatch — Production-grade transparent rsync wrapper
-# Version: 1.1.0
+# Version: 1.2.0
 #
 # Features:
 #   - Transparent drop-in replacement for rsync (all args pass through)
@@ -49,6 +49,10 @@
 #   --no-lock              Disable lock file, allow concurrent runs
 #   --webhook=URL          POST notification to URL on completion
 #   --webhook-on=EVENT     When to fire webhook: always|failure|success|warnings (default: always)
+#   --webhook-header=H:V   Add a custom HTTP header to webhook requests (repeatable)
+#                          e.g. --webhook-header="X-Backup-Signature: HMAC-SHA256-TOKEN"
+#                               --webhook-header="Authorization: Bearer mytoken"
+#   --webhook-secret=SEC   Auto-sign payload with HMAC-SHA256; sends as X-Backup-Signature header
 #   --webhook-test         Test webhook delivery and exit (no sync runs)
 #   --ping-url=URL         GET this URL on success — dead man's switch / heartbeat
 #   --quiet                Suppress wrapper header/footer output
@@ -69,7 +73,7 @@
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly SCRIPT_NAME="dispatch"
 
 # =============================================================================
@@ -95,6 +99,8 @@ NOTIFY_START=false                # Send email when sync starts
 # ── Webhooks ──────────────────────────────────────────────────────────────────
 WEBHOOK_URL=""                    # POST to this URL on completion (Slack, Discord, ntfy.sh...)
 WEBHOOK_ON="always"               # always | failure | success | warnings
+WEBHOOK_HEADERS=()                # Extra HTTP headers: ("Name: Value" "Name2: Value2")
+WEBHOOK_SECRET=""                 # HMAC-SHA256 secret — auto-signs payload as X-Backup-Signature
 
 # ── Dead man's switch ─────────────────────────────────────────────────────────
 PING_URL=""                       # GET this URL on success only (Healthchecks.io, Uptime Kuma...)
@@ -229,6 +235,8 @@ ${BOLD}Wrapper Options:${RESET}
   --no-lock                Disable lock file, allow concurrent runs
   --webhook=URL            POST notification to URL on completion
   --webhook-on=EVENT       When to fire webhook: always|failure|success|warnings (default: always)
+  --webhook-header=H:V     Add a custom HTTP header to webhook requests (repeatable)
+  --webhook-secret=SECRET  HMAC-SHA256-sign the payload; sent as X-Backup-Signature header
   --webhook-test           Test webhook delivery and exit — no sync runs
   --ping-url=URL           GET this URL on success — dead man's switch / heartbeat
   --quiet                  Suppress wrapper header/footer (rsync output unaffected)
@@ -291,6 +299,8 @@ for arg in "$@"; do
     --no-lock)          NO_LOCK=true ;;
     --webhook=*)        WEBHOOK_URL="${arg#--webhook=}" ;;
     --webhook-on=*)     WEBHOOK_ON="${arg#--webhook-on=}" ;;
+    --webhook-header=*) WEBHOOK_HEADERS+=("${arg#--webhook-header=}") ;;
+    --webhook-secret=*) WEBHOOK_SECRET="${arg#--webhook-secret=}" ;;
     --webhook-test)     _WEBHOOK_TEST=true ;;
     --ping-url=*)       PING_URL="${arg#--ping-url=}" ;;
     --quiet)            QUIET=true ;;
@@ -646,12 +656,56 @@ json_escape() {
   printf '%s' "$s"
 }
 
+# ── Webhook HMAC-SHA256 signing ───────────────────────────────────────────────
+# Computes HMAC-SHA256 of $payload using $WEBHOOK_SECRET and returns the hex
+# digest.  openssl is used when available (ubiquitous); sha256hmac is a
+# fallback for systems that have it but not openssl.
+webhook_sign() {
+  local payload="$1"
+  if command -v openssl &>/dev/null; then
+    printf '%s' "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | sed 's/^.* //'
+  elif command -v sha256hmac &>/dev/null; then
+    printf '%s' "$payload" | sha256hmac --key "$WEBHOOK_SECRET" | awk '{print $1}'
+  else
+    warn "openssl not found — cannot compute HMAC-SHA256 signature. Install openssl to use --webhook-secret."
+    echo ""
+  fi
+}
+
+# ── Build curl header flags for custom webhook headers ────────────────────────
+# Emits one "-H" "Name: Value" pair per entry in WEBHOOK_HEADERS, plus the
+# HMAC signature header when WEBHOOK_SECRET is set.  Accepts the payload as
+# $1 so the signature can be computed over the exact bytes being sent.
+build_webhook_header_flags() {
+  local payload="$1"
+  local -a flags=()
+
+  # User-supplied static headers (--webhook-header=Name: Value)
+  for h in "${WEBHOOK_HEADERS[@]:-}"; do
+    [[ -n "$h" ]] && flags+=(-H "$h")
+  done
+
+  # Auto-generated HMAC-SHA256 signature header
+  if [[ -n "$WEBHOOK_SECRET" ]]; then
+    local sig
+    sig=$(webhook_sign "$payload")
+    if [[ -n "$sig" ]]; then
+      flags+=(-H "X-Backup-Signature: HMAC-SHA256=${sig}")
+    fi
+  fi
+
+  # Print each element quoted so the caller can eval or use "${flags[@]}"
+  printf '%s\0' "${flags[@]+"${flags[@]}"}"
+}
+
 # ── Webhook test ──────────────────────────────────────────────────────────────
 webhook_test() {
   [[ -z "$WEBHOOK_URL" ]] && die "--webhook-test requires --webhook=URL to be set (or WEBHOOK_URL in config)"
 
   echo ""
   log "Testing webhook delivery to: ${WEBHOOK_URL}"
+  [[ ${#WEBHOOK_HEADERS[@]} -gt 0 ]] && log "Custom headers : ${WEBHOOK_HEADERS[*]}"
+  [[ -n "$WEBHOOK_SECRET" ]]         && log "HMAC signing   : enabled (X-Backup-Signature: HMAC-SHA256=<digest>)"
 
   local je_host
   je_host=$(json_escape "$(hostname -s)")
@@ -667,12 +721,19 @@ webhook_test() {
   fi
   echo ""
 
+  # Build custom header flags (including HMAC signature if secret is set)
+  local -a extra_header_flags=()
+  while IFS= read -r -d '' flag; do
+    extra_header_flags+=("$flag")
+  done < <(build_webhook_header_flags "$payload")
+
   local http_code webhook_exit=0
   http_code=$(curl --silent --show-error --connect-timeout 10 --max-time 15 \
     -X POST \
     -H "Content-Type: application/json" \
     -H "Title: Dispatch webhook test" \
     -H "Tags: rsync,test" \
+    "${extra_header_flags[@]+"${extra_header_flags[@]}"}" \
     -d "$payload" \
     -w "%{http_code}" \
     -o /dev/null \
@@ -684,7 +745,11 @@ webhook_test() {
   else
     echo -e "${RED}[✘] Webhook test failed (curl exit: ${webhook_exit}, HTTP: ${http_code:-n/a})${RESET}" >&2
     echo -e "${YELLOW}[⚠] Payload sent:${RESET}  $payload"
-    echo -e "${YELLOW}[⚠] Reproduce:${RESET}     curl -v -X POST -H 'Content-Type: application/json' -d '$payload' '$WEBHOOK_URL'"
+    # Build a human-readable reproduce command (static headers only; secret masked)
+    local dbg_headers="-H 'Content-Type: application/json'"
+    for h in "${WEBHOOK_HEADERS[@]:-}"; do [[ -n "$h" ]] && dbg_headers+=" -H '$h'"; done
+    [[ -n "$WEBHOOK_SECRET" ]] && dbg_headers+=" -H 'X-Backup-Signature: HMAC-SHA256=<computed>'"
+    echo -e "${YELLOW}[⚠] Reproduce:${RESET}     curl -v -X POST ${dbg_headers} -d '${payload}' '${WEBHOOK_URL}'"
   fi
   echo ""
   return "$webhook_exit"
@@ -741,6 +806,12 @@ dispatch_webhook() {
       "$je_result" "$je_host" "$je_src" "$je_dest" "$je_elapsed" "$je_attempt")
   fi
 
+  # Build custom header flags (including HMAC signature if secret is set)
+  local -a extra_header_flags=()
+  while IFS= read -r -d '' flag; do
+    extra_header_flags+=("$flag")
+  done < <(build_webhook_header_flags "$payload")
+
   # Capture the HTTP status code.  curl exits 0 even on 4xx/5xx responses,
   # so we must inspect the code to detect silent rejections (e.g. Discord
   # returning 400 because the wrong field name was used).
@@ -750,6 +821,7 @@ dispatch_webhook() {
     -H "Content-Type: application/json" \
     -H "Title: Dispatch ${status_text}" \
     -H "Tags: rsync,backup" \
+    "${extra_header_flags[@]+"${extra_header_flags[@]}"}" \
     -d "$payload" \
     -w "%{http_code}" \
     -o /dev/null \
@@ -759,7 +831,10 @@ dispatch_webhook() {
     echo -e "${GREEN}[✔] Webhook delivered (HTTP ${http_code}): ${WEBHOOK_URL}${RESET}"
   else
     echo -e "${YELLOW}[⚠] Webhook delivery failed (curl exit: ${webhook_exit}, HTTP: ${http_code:-n/a}): ${WEBHOOK_URL}${RESET}"
-    echo -e "${YELLOW}[⚠] Debug: curl -v -X POST -H 'Content-Type: application/json' -d '${payload}' '${WEBHOOK_URL}'${RESET}"
+    local dbg_headers="-H 'Content-Type: application/json'"
+    for h in "${WEBHOOK_HEADERS[@]:-}"; do [[ -n "$h" ]] && dbg_headers+=" -H '$h'"; done
+    [[ -n "$WEBHOOK_SECRET" ]] && dbg_headers+=" -H 'X-Backup-Signature: HMAC-SHA256=<computed>'"
+    echo -e "${YELLOW}[⚠] Debug: curl -v -X POST ${dbg_headers} -d '${payload}' '${WEBHOOK_URL}'${RESET}"
   fi
 }
 
@@ -980,6 +1055,8 @@ acquire_lock
 LOG_LABEL="$( $LOG_ENABLED && echo "$LOG_FILE" || echo "disabled" )"
 SMTP_LABEL="$( $SMTP_ENABLED && echo "enabled (notify: ${NOTIFY_ON})" || echo "disabled" )"
 WEBHOOK_LABEL="$( [[ -n "$WEBHOOK_URL" ]] && echo "${WEBHOOK_URL} (on: ${WEBHOOK_ON})" || echo "disabled" )"
+WEBHOOK_HEADER_LABEL="$( [[ ${#WEBHOOK_HEADERS[@]} -gt 0 ]] && printf '%s  ' "${WEBHOOK_HEADERS[@]}" || echo "none" )"
+WEBHOOK_SECRET_LABEL="$( [[ -n "$WEBHOOK_SECRET" ]] && echo "set (HMAC-SHA256)" || echo "not set" )"
 PING_LABEL="$( [[ -n "$PING_URL" ]] && echo "${PING_URL}" || echo "disabled" )"
 
 $QUIET || cat << 'ASCIIART'
@@ -1006,6 +1083,8 @@ log "Dry run     : $IS_DRY_RUN"
 log "Log file    : $LOG_LABEL"
 log "SMTP        : $SMTP_LABEL"
 log "Webhook     : $WEBHOOK_LABEL"
+[[ -n "$WEBHOOK_URL" && ${#WEBHOOK_HEADERS[@]} -gt 0 ]] && log "Wbhk headers: $WEBHOOK_HEADER_LABEL"
+[[ -n "$WEBHOOK_URL" ]] && log "Wbhk signing: $WEBHOOK_SECRET_LABEL"
 log "Ping URL    : $PING_LABEL"
 [[ -n "$PRE_HOOK"  ]] && log "Pre-hook    : $PRE_HOOK"
 [[ -n "$POST_HOOK" ]] && log "Post-hook   : $POST_HOOK"
